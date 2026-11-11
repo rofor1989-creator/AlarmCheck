@@ -40,17 +40,21 @@ function parseAnalysis(text: string, isRefusal: boolean): AnalysisCounts {
   return res;
 }
 
-const ANALYSIS_SERIES: { key: keyof AnalysisCounts; label: string; color: string }[] = [
-  { key: 'correct', label: 'Правильно (П)', color: '#16a34a' },
-  { key: 'incorrect', label: 'Неправильно (НП)', color: '#dc2626' },
-  { key: 'arSuccess', label: 'АРВ успешно (У)', color: '#2563eb' },
-  { key: 'arFail', label: 'АРВ неуспешно (НУ)', color: '#f59e0b' },
-  { key: 'refusal', label: 'Отказ', color: '#7c3aed' },
+// Подвкладки графиков на вкладке "Анализ"
+type ChartTab = 'outages' | 'protection' | 'arv' | 'refusal' | 'summary';
+
+const CHART_TABS: { id: ChartTab; label: string }[] = [
+  { id: 'outages', label: 'Отключения' },
+  { id: 'protection', label: 'Работа защит' },
+  { id: 'arv', label: 'Работа АПВ' },
+  { id: 'refusal', label: 'Отказы' },
+  { id: 'summary', label: 'Сводная' },
 ];
 
-// ---------- Вкладка "Анализ": столбчатая диаграмма отключений по периодам (Chart.js) ----------
+// ---------- Вкладка "Анализ": 5 подвкладок с графиками Chart.js ----------
 function AnalysisTab({ events }: { events: OutageEvent[] }) {
   const [mode, setMode] = useState<'year' | 'month'>('year');
+  const [activeChart, setActiveChart] = useState<ChartTab>('outages');
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const chartRef = useRef<any>(null);
 
@@ -90,66 +94,113 @@ function AnalysisTab({ events }: { events: OutageEvent[] }) {
     if (!ChartLib || !canvasRef.current) return;
     if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; }
 
-    const datasets = ANALYSIS_SERIES.map((s) => ({
-      label: s.label,
-      data: periods.map((p) => p.data[s.key]),
-      backgroundColor: s.color,
-      stack: 'analysis',
+    const labels = periods.map((p) => p.label);
+    const lineDs = (label: string, data: number[], color: string) => ({
+      label,
+      data,
+      borderColor: color,
+      backgroundColor: color,
+      pointBackgroundColor: color,
+      pointRadius: 4,
+      borderWidth: 2,
+      tension: 0.25,
+      fill: false,
+    });
+    const barDs = (label: string, data: number[], color: string, stack?: string) => ({
+      label,
+      data,
+      backgroundColor: color,
+      ...(stack ? { stack } : {}),
       borderRadius: 3,
-    }));
-    // общий столбец: количество отключений за период
-    datasets.unshift({
-      label: 'Количество отключений',
-      data: periods.map((p) => p.data.total),
-      backgroundColor: '#334155',
-      stack: 'total',
-      borderRadius: 3,
+      barPercentage: 0.8,
     });
 
+    let type: 'line' | 'bar' = 'bar';
+    let datasets: any[] = [];
+
+    switch (activeChart) {
+      case 'outages': // График 1: линия количества отключений (синий)
+        type = 'line';
+        datasets = [lineDs('Отключения', periods.map((p) => p.data.total), '#3b82f6')];
+        break;
+      case 'protection': // График 2: составной столбик П (зелёный) + НП (красный)
+        type = 'bar';
+        datasets = [
+          barDs('П — правильно', periods.map((p) => p.data.correct), '#10b981', 'prot'),
+          barDs('НП — неправильно', periods.map((p) => p.data.incorrect), '#ef4444', 'prot'),
+        ];
+        break;
+      case 'arv': // График 3: составной столбик У (зелёный) + НУ (красный)
+        type = 'bar';
+        datasets = [
+          barDs('У — успешно', periods.map((p) => p.data.arSuccess), '#10b981', 'arv'),
+          barDs('НУ — неуспешно', periods.map((p) => p.data.arFail), '#ef4444', 'arv'),
+        ];
+        break;
+      case 'refusal': // График 4: линия отказов (оранжевый)
+        type = 'line';
+        datasets = [lineDs('Отказы', periods.map((p) => p.data.refusal), '#f59e0b')];
+        break;
+      case 'summary': // График 5 "Сводная": 6 серий (столбики), визуально 4 параметра рядом
+        type = 'bar';
+        datasets = [
+          barDs('Отключения', periods.map((p) => p.data.total), '#3b82f6', 'outages'),
+          barDs('П', periods.map((p) => p.data.correct), '#10b981', 'protection'),
+          barDs('НП', periods.map((p) => p.data.incorrect), '#ef4444', 'protection'),
+          barDs('У', periods.map((p) => p.data.arSuccess), '#10b981', 'arv'),
+          barDs('НУ', periods.map((p) => p.data.arFail), '#ef4444', 'arv'),
+          barDs('Отказы', periods.map((p) => p.data.refusal), '#f59e0b', 'refusal'),
+        ].map((ds) => ({ ...ds, barPercentage: 0.6, categoryPercentage: 0.8 }));
+        break;
+    }
+
+    // Общий tooltip для всех пяти графиков: полная статистика за период
+    const tooltipFooter = (items: any[]) => {
+      if (!items.length) return '';
+      const d = periods[items[0].dataIndex]?.data;
+      if (!d) return '';
+      return [
+        '————————————',
+        `Всего отключений: ${d.total}`,
+        `Правильная работа защит: ${d.correct}`,
+        `Неправильная работа: ${d.incorrect}`,
+        `Отказы: ${d.refusal}`,
+        `Успешное АПВ: ${d.arSuccess}`,
+        `Неуспешное АПВ: ${d.arFail}`,
+      ];
+    };
+
+    const isBarStacked = type === 'bar';
+
     chartRef.current = new ChartLib(canvasRef.current, {
-      type: 'bar',
-      data: { labels: periods.map((p) => p.label), datasets },
+      type,
+      data: { labels, datasets },
       options: {
         responsive: true,
         maintainAspectRatio: false,
-        interaction: { mode: 'index', intersect: false },
+        interaction: { mode: activeChart === 'summary' ? 'index' : 'nearest', intersect: activeChart !== 'summary' },
         plugins: {
-          legend: { position: 'bottom' },
-          tooltip: {
-            callbacks: {
-              // при наведении на столбец показываем сумму всех категорий за период
-              footer: (items: any[]) => {
-                if (!items.length) return '';
-                const idx = items[0].dataIndex;
-                const d = periods[idx]?.data;
-                if (!d) return '';
-                return [
-                  '———— Итого за период ————',
-                  `Правильно (П): ${d.correct}`,
-                  `Неправильно (НП): ${d.incorrect}`,
-                  `АРВ успешно (У): ${d.arSuccess}`,
-                  `АРВ неуспешно (НУ): ${d.arFail}`,
-                  `Отказ: ${d.refusal}`,
-                  `Всего отключений: ${d.total}`,
-                ];
-              },
-            },
-          },
+          legend: { position: 'top' },
+          tooltip: { callbacks: { footer: tooltipFooter } },
         },
         scales: {
-          x: { stacked: true },
-          y: { stacked: true, beginAtZero: true, ticks: { precision: 0 } },
+          x: { ...(isBarStacked ? { stacked: true } : {}) },
+          y: {
+            beginAtZero: true,
+            ...(isBarStacked ? { stacked: true } : {}),
+            ticks: { stepSize: 1, precision: 0 },
+          },
         },
       },
     });
     return () => {
       if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; }
     };
-  }, [periods]);
+  }, [periods, activeChart]);
 
   return (
     <div className="bg-white rounded-lg shadow border p-4">
-      <div className="flex flex-wrap items-center gap-3 mb-4">
+      <div className="flex flex-wrap items-center gap-3 mb-3">
         <h2 className="text-base font-bold flex items-center gap-2"><BarChart3 size={18} /> Анализ работы РЗА / АПВ</h2>
         <label className="text-sm font-medium text-slate-600 flex items-center gap-2">
           Период:
@@ -162,8 +213,21 @@ function AnalysisTab({ events }: { events: OutageEvent[] }) {
             <option value="month">По месяцам</option>
           </select>
         </label>
-        <span className="text-xs text-slate-500 ml-auto">Наведите на столбец — в тултипе отобразится сумма по категориям за период.</span>
+        <span className="text-xs text-slate-500 ml-auto">Наведите на столбец/точку — в тултипе отобразится полная статистика за период.</span>
       </div>
+
+      {/* Подвкладки графиков */}
+      <div className="flex flex-wrap items-center gap-1 mb-4 border-b border-slate-200">
+        {CHART_TABS.map((t) => (
+          <button key={t.id} onClick={() => setActiveChart(t.id)}
+            className={`px-4 py-1.5 rounded-t-md text-sm font-semibold border border-b-0 ${
+              activeChart === t.id ? 'bg-white border-slate-300 text-blue-700 -mb-px' : 'bg-slate-200/70 text-slate-600 hover:bg-slate-100 border-transparent'
+            }`}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
       {periods.length === 0 ? (
         <div className="py-16 text-center text-slate-400 text-sm">Нет событий с корректной датой для построения графика.</div>
       ) : (
@@ -954,7 +1018,8 @@ export default function App() {
 
       {activeTab === 'analysis' ? (
         <main className="max-w-[1800px] mx-auto p-4">
-          <AnalysisTab events={events} />
+          {/* Анализ строится по отфильтрованным событиям: учтены вкладки лет и быстрый поиск */}
+          <AnalysisTab events={filtered} />
         </main>
       ) : (
       <>
