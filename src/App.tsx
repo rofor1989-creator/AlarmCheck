@@ -22,8 +22,8 @@ declare global {
 interface AnalysisCounts {
   correct: number;    // "П" / "П-N" — правильно
   incorrect: number;  // "НП" / "НП-N" — неправильно
-  arSuccess: number;  // "У" без "НУ" — успешность АРВ/АПВ
-  arFail: number;     // "НУ" — неуспешность АРВ/АПВ
+  arSuccess: number;  // "У" без "НУ" — успешность АПВ
+  arFail: number;     // "НУ" — неуспешность АПВ
   refusal: number;    // метка "Отказ" события
 }
 
@@ -43,8 +43,8 @@ function parseAnalysis(text: string, isRefusal: boolean): AnalysisCounts {
 const ANALYSIS_SERIES: { key: keyof AnalysisCounts; label: string; color: string }[] = [
   { key: 'correct', label: 'Правильно (П)', color: '#16a34a' },
   { key: 'incorrect', label: 'Неправильно (НП)', color: '#dc2626' },
-  { key: 'arSuccess', label: 'АРВ успешно (У)', color: '#2563eb' },
-  { key: 'arFail', label: 'АРВ неуспешно (НУ)', color: '#f59e0b' },
+  { key: 'arSuccess', label: 'АПВ успешно (У)', color: '#2563eb' },
+  { key: 'arFail', label: 'АПВ неуспешно (НУ)', color: '#f59e0b' },
   { key: 'refusal', label: 'Отказ', color: '#7c3aed' },
 ];
 
@@ -127,8 +127,8 @@ function AnalysisTab({ events }: { events: OutageEvent[] }) {
                   '———— Итого за период ————',
                   `Правильно (П): ${d.correct}`,
                   `Неправильно (НП): ${d.incorrect}`,
-                  `АРВ успешно (У): ${d.arSuccess}`,
-                  `АРВ неуспешно (НУ): ${d.arFail}`,
+                  `АПВ успешно (У): ${d.arSuccess}`,
+                  `АПВ неуспешно (НУ): ${d.arFail}`,
                   `Отказ: ${d.refusal}`,
                   `Всего отключений: ${d.total}`,
                 ];
