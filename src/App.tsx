@@ -7,10 +7,173 @@ import {
 import { parseWorkbook, exportToExcel, ImportColumn, ParsedSheet } from './excelUtils';
 import {
   Plus, Upload, Download, Save, LogOut, Trash2, Filter, X, FileText, AlertTriangle,
+  FileJson, FolderOpen, BarChart3, Table as TableIcon,
 } from 'lucide-react';
 
 // Версия 3 — пересборка для валидации ветки (формат дат дд.мм.гг чч:мм)
 const STORAGE_KEY = 'outage_program_events_v14';
+
+// ---------- Глобальный тип Chart.js (подключается через CDN в index.html) ----------
+declare global {
+  interface Window { Chart?: any }
+}
+
+// ---------- Анализ текста "Анализ работы" ("П-2", "НП-N", "У/НУ АПВ", отказ) ----------
+interface AnalysisCounts {
+  correct: number;    // "П" / "П-N" — правильно
+  incorrect: number;  // "НП" / "НП-N" — неправильно
+  arSuccess: number;  // "У" без "НУ" — успешность АРВ/АПВ
+  arFail: number;     // "НУ" — неуспешность АРВ/АПВ
+  refusal: number;    // метка "Отказ" события
+}
+
+const EMPTY_ANALYSIS: AnalysisCounts = { correct: 0, incorrect: 0, arSuccess: 0, arFail: 0, refusal: 0 };
+
+function parseAnalysis(text: string, isRefusal: boolean): AnalysisCounts {
+  const res: AnalysisCounts = { ...EMPTY_ANALYSIS };
+  const t = String(text ?? '').toUpperCase().replace(/Ё/g, 'Е');
+  if (/НП\s*-?\s*\d*/.test(t)) res.incorrect++;        // НП / НП-N — неправильно
+  else if (/П\s*-?\s*\d*/.test(t)) res.correct++;      // П / П-N — правильно
+  if (/НУ/.test(t)) res.arFail++;                      // НУ — неуспешно
+  else if (/\bU\b|У/.test(t.replace(/НУ/g, ''))) res.arSuccess++; // "У" без "НУ" — успешно
+  if (isRefusal) res.refusal++;                         // событие помечено как "Отказ"
+  return res;
+}
+
+const ANALYSIS_SERIES: { key: keyof AnalysisCounts; label: string; color: string }[] = [
+  { key: 'correct', label: 'Правильно (П)', color: '#16a34a' },
+  { key: 'incorrect', label: 'Неправильно (НП)', color: '#dc2626' },
+  { key: 'arSuccess', label: 'АРВ успешно (У)', color: '#2563eb' },
+  { key: 'arFail', label: 'АРВ неуспешно (НУ)', color: '#f59e0b' },
+  { key: 'refusal', label: 'Отказ', color: '#7c3aed' },
+];
+
+// ---------- Вкладка "Анализ": столбчатая диаграмма отключений по периодам (Chart.js) ----------
+function AnalysisTab({ events }: { events: OutageEvent[] }) {
+  const [mode, setMode] = useState<'year' | 'month'>('year');
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const chartRef = useRef<any>(null);
+
+  // группировка событий по периодам + подсчёт категорий анализа
+  const periods = useMemo(() => {
+    const map = new Map<string, AnalysisCounts & { total: number }>();
+    const keyOf = (e: OutageEvent): string | null => {
+      const d = parseDateStr(e.date);
+      if (!d) return null;
+      if (mode === 'year') return String(d.getFullYear());
+      const MONTHS = ['Янв', 'Фев', 'Мар', 'Апр', 'Май', 'Июн', 'Июл', 'Авг', 'Сен', 'Окт', 'Ноя', 'Дек'];
+      return `${MONTHS[d.getMonth()]} ${String(d.getFullYear()).slice(2)}`;
+    };
+    const sortKey = (k: string): number => {
+      const d = mode === 'year' ? parseDateStr(`01.01.${k}`) : parseDateStr(`01.${k}`);
+      return d ? d.getTime() : 0;
+    };
+    for (const e of events) {
+      const k = keyOf(e);
+      if (!k) continue;
+      const cur = map.get(k) ?? { ...EMPTY_ANALYSIS, total: 0 };
+      const c = parseAnalysis(e.analysis, e.refusal);
+      cur.total++;
+      cur.correct += c.correct;
+      cur.incorrect += c.incorrect;
+      cur.arSuccess += c.arSuccess;
+      cur.arFail += c.arFail;
+      cur.refusal += c.refusal;
+      map.set(k, cur);
+    }
+    const keys = [...map.keys()].sort((a, b) => sortKey(a) - sortKey(b));
+    return keys.map((k) => ({ label: k, data: map.get(k)! }));
+  }, [events, mode]);
+
+  useEffect(() => {
+    const ChartLib = window.Chart;
+    if (!ChartLib || !canvasRef.current) return;
+    if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; }
+
+    const datasets = ANALYSIS_SERIES.map((s) => ({
+      label: s.label,
+      data: periods.map((p) => p.data[s.key]),
+      backgroundColor: s.color,
+      stack: 'analysis',
+      borderRadius: 3,
+    }));
+    // общий столбец: количество отключений за период
+    datasets.unshift({
+      label: 'Количество отключений',
+      data: periods.map((p) => p.data.total),
+      backgroundColor: '#334155',
+      stack: 'total',
+      borderRadius: 3,
+    });
+
+    chartRef.current = new ChartLib(canvasRef.current, {
+      type: 'bar',
+      data: { labels: periods.map((p) => p.label), datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { position: 'bottom' },
+          tooltip: {
+            callbacks: {
+              // при наведении на столбец показываем сумму всех категорий за период
+              footer: (items: any[]) => {
+                if (!items.length) return '';
+                const idx = items[0].dataIndex;
+                const d = periods[idx]?.data;
+                if (!d) return '';
+                return [
+                  '———— Итого за период ————',
+                  `Правильно (П): ${d.correct}`,
+                  `Неправильно (НП): ${d.incorrect}`,
+                  `АРВ успешно (У): ${d.arSuccess}`,
+                  `АРВ неуспешно (НУ): ${d.arFail}`,
+                  `Отказ: ${d.refusal}`,
+                  `Всего отключений: ${d.total}`,
+                ];
+              },
+            },
+          },
+        },
+        scales: {
+          x: { stacked: true },
+          y: { stacked: true, beginAtZero: true, ticks: { precision: 0 } },
+        },
+      },
+    });
+    return () => {
+      if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; }
+    };
+  }, [periods]);
+
+  return (
+    <div className="bg-white rounded-lg shadow border p-4">
+      <div className="flex flex-wrap items-center gap-3 mb-4">
+        <h2 className="text-base font-bold flex items-center gap-2"><BarChart3 size={18} /> Анализ работы РЗА / АПВ</h2>
+        <label className="text-sm font-medium text-slate-600 flex items-center gap-2">
+          Период:
+          <select
+            value={mode}
+            onChange={(e) => setMode(e.target.value as 'year' | 'month')}
+            className="border border-slate-300 rounded px-2 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            <option value="year">По годам</option>
+            <option value="month">По месяцам</option>
+          </select>
+        </label>
+        <span className="text-xs text-slate-500 ml-auto">Наведите на столбец — в тултипе отобразится сумма по категориям за период.</span>
+      </div>
+      {periods.length === 0 ? (
+        <div className="py-16 text-center text-slate-400 text-sm">Нет событий с корректной датой для построения графика.</div>
+      ) : (
+        <div style={{ height: 420 }}>
+          <canvas ref={canvasRef} />
+        </div>
+      )}
+    </div>
+  );
+}
 
 function loadEvents(): OutageEvent[] {
   try {
@@ -397,6 +560,8 @@ export default function App() {
   const [confirmExit, setConfirmExit] = useState(false);
   const [importSheets, setImportSheets] = useState<ParsedSheet[] | null>(null);
   const [hoveredOsc, setHoveredOsc] = useState<{ evId: string; x: number; y: number } | null>(null);
+  const [activeTab, setActiveTab] = useState<'table' | 'analysis'>('table');
+  const jsonInputRef = useRef<HTMLInputElement>(null);
   const oscHideTimer = useRef<number | null>(null);
   const oscPopupRef = useRef<HTMLDivElement | null>(null);
   // «прищепка» тулtipа: если курсор зажат (идёт выделение текста в тултипе) — не скрываем окно
@@ -495,6 +660,52 @@ export default function App() {
     window.addEventListener('beforeunload', handler);
     return () => window.removeEventListener('beforeunload', handler);
   }, [dirty]);
+
+  // ---------- Сохранение всей базы событий в JSON-файл ----------
+  const saveToJson = useCallback(() => {
+    try {
+      const blob = new Blob([JSON.stringify(events, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'outages.json';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      showToast('Файл outages.json сохранён');
+    } catch (e) {
+      showToast('Не удалось сохранить JSON');
+    }
+  }, [events]);
+
+  // ---------- Загрузка базы событий из JSON-файла ----------
+  const loadFromJson = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(String(reader.result));
+        const list: OutageEvent[] = Array.isArray(data) ? data : (Array.isArray(data?.events) ? data.events : null);
+        if (!list) { showToast('В файле не найден массив событий'); return; }
+        const normalized = list.map((e, i) => ({
+          ...EMPTY_EVENT,
+          ...e,
+          id: e.id ?? crypto.randomUUID(),
+          num: e.num ?? i + 1,
+          oscillograms: Array.isArray(e.oscillograms) ? e.oscillograms : [],
+        }));
+        setEvents(normalized);
+        const snap = JSON.stringify(normalized);
+        localStorage.setItem(STORAGE_KEY, snap);
+        setSavedSnapshot(snap);
+        showToast(`Загружено событий из JSON: ${normalized.length}`);
+      } catch {
+        showToast('Ошибка чтения JSON: файл повреждён или имеет неверный формат');
+      }
+    };
+    reader.onerror = () => showToast('Не удалось прочитать файл');
+    reader.readAsText(file);
+  };
 
   // годы для вкладок (по умолчанию открывается самый последний год)
   const years = useMemo(() => {
@@ -659,6 +870,14 @@ export default function App() {
             <button className={`${btnCls} ${dirty ? 'bg-amber-500 hover:bg-amber-600 text-white' : 'bg-slate-500 text-slate-200'}`} onClick={save}>
               <Save size={16} /> Сохранить {dirty && <span className="w-2 h-2 rounded-full bg-white inline-block" />}
             </button>
+            <button className={`${btnCls} bg-emerald-600 hover:bg-emerald-700 text-white`} onClick={saveToJson} title="Выгрузить все события в файл outages.json">
+              <FileJson size={16} /> Сохранить в JSON
+            </button>
+            <button className={`${btnCls} bg-emerald-700 hover:bg-emerald-800 text-white`} onClick={() => jsonInputRef.current?.click()} title="Загрузить события из файла outages.json">
+              <FolderOpen size={16} /> Загрузить из JSON
+            </button>
+            <input ref={jsonInputRef} type="file" accept=".json" className="hidden"
+              onChange={(e) => { const f = e.target.files?.[0]; if (f) loadFromJson(f); e.target.value = ''; }} />
             <button className={`${btnCls} bg-red-600 hover:bg-red-700 text-white`} onClick={() => setConfirmClear(true)}>
               <Trash2 size={16} /> Очистить таблицу
             </button>
@@ -717,6 +936,28 @@ export default function App() {
         </div>
       </div>
 
+      {/* Переключатель вкладок: Таблица / Анализ */}
+      <div className="max-w-[1800px] mx-auto px-4 pt-3 flex flex-wrap items-center gap-1">
+        <button onClick={() => setActiveTab('table')}
+          className={`inline-flex items-center gap-1.5 px-4 py-1.5 rounded-t-md text-sm font-semibold border border-b-0 ${
+            activeTab === 'table' ? 'bg-white border-slate-300 text-blue-700 -mb-px' : 'bg-slate-200/70 text-slate-600 hover:bg-slate-100 border-transparent'
+          }`}>
+          <TableIcon size={14} /> Таблица
+        </button>
+        <button onClick={() => setActiveTab('analysis')}
+          className={`inline-flex items-center gap-1.5 px-4 py-1.5 rounded-t-md text-sm font-semibold border border-b-0 ${
+            activeTab === 'analysis' ? 'bg-white border-slate-300 text-blue-700 -mb-px' : 'bg-slate-200/70 text-slate-600 hover:bg-slate-100 border-transparent'
+          }`}>
+          <BarChart3 size={14} /> Анализ
+        </button>
+      </div>
+
+      {activeTab === 'analysis' ? (
+        <main className="max-w-[1800px] mx-auto p-4">
+          <AnalysisTab events={events} />
+        </main>
+      ) : (
+      <>
       {/* Вкладки по годам */}
       <div className="max-w-[1800px] mx-auto px-4 pt-3 flex flex-wrap items-center gap-1 border-b border-slate-200 pb-0">
         <button onClick={() => setActiveYear('all')}
@@ -842,9 +1083,20 @@ export default function App() {
                             }}
                             onMouseLeave={scheduleOscHide}>
                             {e.oscillograms.length > 0 ? (
-                              <span className={`inline-flex items-center gap-1 cursor-help ${e.refusal ? 'text-white' : 'text-blue-700'}`}>
-                                <FileText size={14} /> {e.oscillograms.length} шт.
-                              </span>
+                              <div className={`flex flex-col gap-0.5 cursor-help ${e.refusal ? 'text-white' : ''}`}>
+                                {/* Относительные ссылки на файлы осциллограмм (папка «Осциллограммы» рядом со страницей) */}
+                                {e.oscillograms.map((o) => (
+                                  <a key={o.id}
+                                    href={`Осциллограммы/${o.fileName}`}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    title={o.name}
+                                    onClick={(ev) => { ev.stopPropagation(); clearOscHide(); setHoveredOsc(null); }}
+                                    className={`truncate text-xs hover:underline ${e.refusal ? 'text-white underline decoration-red-300' : 'text-blue-600'}`}>
+                                    {o.fileName}
+                                  </a>
+                                ))}
+                              </div>
                             ) : (
                               <span className={e.refusal ? 'text-red-200' : 'text-slate-300'}>—</span>
                             )}
@@ -882,6 +1134,8 @@ export default function App() {
           Показано: {filtered.length} из {events.length}. Красным цветом выделены события с отказом. ◔ — недооформленное событие (есть пустые ячейки).
         </div>
       </main>
+      </>
+      )}
 
       {/* Тултип с осциллограммами при наведении */}
       {hoveredOsc && hoveredEvent && hoveredEvent.oscillograms.length > 0 && createPortal(
