@@ -22,8 +22,8 @@ declare global {
 interface AnalysisCounts {
   correct: number;    // "П" / "П-N" — правильно
   incorrect: number;  // "НП" / "НП-N" — неправильно
-  arSuccess: number;  // "У" без "НУ" — успешность АРВ/АПВ
-  arFail: number;     // "НУ" — неуспешность АРВ/АПВ
+  arSuccess: number;  // "У" без "НУ" — успешность АПВ
+  arFail: number;     // "НУ" — неуспешность АПВ
   refusal: number;    // метка "Отказ" события
 }
 
@@ -49,6 +49,12 @@ const CHART_TABS: { id: ChartTab; label: string }[] = [
   { id: 'arv', label: 'Работа АПВ' },
   { id: 'refusal', label: 'Отказы' },
   { id: 'summary', label: 'Сводная' },
+const ANALYSIS_SERIES: { key: keyof AnalysisCounts; label: string; color: string }[] = [
+  { key: 'correct', label: 'Правильно (П)', color: '#16a34a' },
+  { key: 'incorrect', label: 'Неправильно (НП)', color: '#dc2626' },
+  { key: 'arSuccess', label: 'АПВ успешно (У)', color: '#2563eb' },
+  { key: 'arFail', label: 'АПВ неуспешно (НУ)', color: '#f59e0b' },
+  { key: 'refusal', label: 'Отказ', color: '#7c3aed' },
 ];
 
 // ---------- Вкладка "Анализ": 5 подвкладок с графиками Chart.js ----------
@@ -217,6 +223,27 @@ function AnalysisTab({ events }: { events: OutageEvent[] }) {
         plugins: {
           legend: { position: 'top' },
           tooltip: { callbacks: { footer: tooltipFooter } },
+          legend: { position: 'bottom' },
+          tooltip: {
+            callbacks: {
+              // при наведении на столбец показываем сумму всех категорий за период
+              footer: (items: any[]) => {
+                if (!items.length) return '';
+                const idx = items[0].dataIndex;
+                const d = periods[idx]?.data;
+                if (!d) return '';
+                return [
+                  '———— Итого за период ————',
+                  `Правильно (П): ${d.correct}`,
+                  `Неправильно (НП): ${d.incorrect}`,
+                  `АПВ успешно (У): ${d.arSuccess}`,
+                  `АПВ неуспешно (НУ): ${d.arFail}`,
+                  `Отказ: ${d.refusal}`,
+                  `Всего отключений: ${d.total}`,
+                ];
+              },
+            },
+          },
         },
         scales: {
           x: { ...(isBarStacked ? { stacked: true } : {}) },
