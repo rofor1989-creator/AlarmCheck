@@ -65,12 +65,9 @@ function AnalysisTab({ events }: { events: OutageEvent[] }) {
       const d = parseDateStr(e.date);
       if (!d) return null;
       if (mode === 'year') return String(d.getFullYear());
-      const MONTHS = ['Янв', 'Фев', 'Мар', 'Апр', 'Май', 'Июн', 'Июл', 'Авг', 'Сен', 'Окт', 'Ноя', 'Дек'];
-      return `${MONTHS[d.getMonth()]} ${String(d.getFullYear()).slice(2)}`;
-    };
-    const sortKey = (k: string): number => {
-      const d = mode === 'year' ? parseDateStr(`01.01.${k}`) : parseDateStr(`01.${k}`);
-      return d ? d.getTime() : 0;
+      // формат метки "ММ.ГГГГ" — для хронологической сортировки слева направо
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      return `${mm}.${d.getFullYear()}`;
     };
     for (const e of events) {
       const k = keyOf(e);
@@ -85,8 +82,25 @@ function AnalysisTab({ events }: { events: OutageEvent[] }) {
       cur.refusal += c.refusal;
       map.set(k, cur);
     }
-    const keys = [...map.keys()].sort((a, b) => sortKey(a) - sortKey(b));
-    return keys.map((k) => ({ label: k, data: map.get(k)! }));
+    // 1) группировка по периоду
+    const keys = [...map.keys()];
+
+    // 2) явная хронологическая сортировка меток (слева направо)
+    const cmp = (a: string, b: string): number => {
+      if (mode === 'year') return Number(a) - Number(b);            // По годам: возрастание
+      const [mA, yA] = a.split('.').map(Number);                    // По месяцам: "ММ.ГГГГ"
+      const [mB, yB] = b.split('.').map(Number);
+      if (yA !== yB) return yA - yB;
+      return mA - mB;
+    };
+    const sortedIndices = keys
+      .map((label, index) => ({ label, index }))
+      .sort((x, y) => cmp(x.label, y.label))
+      .map((item) => item.index);
+
+    // 3) синхронно пересобираем периоды в отсортированном порядке
+    const orderedKeys = sortedIndices.map((i) => keys[i]);
+    return orderedKeys.map((k) => ({ label: k, data: map.get(k)! }));
   }, [events, mode]);
 
   useEffect(() => {
@@ -94,7 +108,7 @@ function AnalysisTab({ events }: { events: OutageEvent[] }) {
     if (!ChartLib || !canvasRef.current) return;
     if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; }
 
-    const labels = periods.map((p) => p.label);
+    const rawLabels = periods.map((p) => p.label);
     const lineDs = (label: string, data: number[], color: string) => ({
       label,
       data,
@@ -154,10 +168,31 @@ function AnalysisTab({ events }: { events: OutageEvent[] }) {
         break;
     }
 
+    // Явная хронологическая сортировка меток и синхронная пересборка данных серий
+    // (единый универсальный механизм для всех пяти подвкладок)
+    const cmpLabel = (a: string, b: string): number => {
+      if (mode === 'year') return Number(a) - Number(b);            // По годам: возрастание
+      const [mA, yA] = a.split('.').map(Number);                    // По месяцам: "ММ.ГГГГ"
+      const [mB, yB] = b.split('.').map(Number);
+      if (yA !== yB) return yA - yB;
+      return mA - mB;
+    };
+    const sortedIndices = rawLabels
+      .map((label, index) => ({ label, index }))
+      .sort((x, y) => cmpLabel(x.label, y.label))
+      .map((item) => item.index);
+
+    const labels = sortedIndices.map((i) => rawLabels[i]);
+    const periodsSorted = sortedIndices.map((i) => periods[i]);     // для tooltip в правильном порядке
+    const sortedDatasets = datasets.map((dataset) => ({
+      ...dataset,
+      data: sortedIndices.map((i) => dataset.data[i]),
+    }));
+
     // Общий tooltip для всех пяти графиков: полная статистика за период
     const tooltipFooter = (items: any[]) => {
       if (!items.length) return '';
-      const d = periods[items[0].dataIndex]?.data;
+      const d = periodsSorted[items[0].dataIndex]?.data;
       if (!d) return '';
       return [
         '————————————',
@@ -174,7 +209,7 @@ function AnalysisTab({ events }: { events: OutageEvent[] }) {
 
     chartRef.current = new ChartLib(canvasRef.current, {
       type,
-      data: { labels, datasets },
+      data: { labels, datasets: sortedDatasets },
       options: {
         responsive: true,
         maintainAspectRatio: false,
@@ -196,7 +231,7 @@ function AnalysisTab({ events }: { events: OutageEvent[] }) {
     return () => {
       if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; }
     };
-  }, [periods, activeChart]);
+  }, [periods, activeChart, mode]);
 
   return (
     <div className="bg-white rounded-lg shadow border p-4">
@@ -797,6 +832,25 @@ export default function App() {
     }
   }, [years, activeYear]);
 
+  // Количество событий на вкладках лет С УЧЁТОМ быстрого фильтра,
+  // но БЕЗ учёта активной вкладки года (activeYear) и поиска (searchText)
+  const eventsForYearTabs = useMemo(() => {
+    let list = events;
+    if (quickFilter === 'refusal') list = list.filter((e) => e.refusal);
+    else if (quickFilter === 'v330') list = list.filter((e) => e.voltage === '330');
+    else if (quickFilter === 'v110') list = list.filter((e) => e.voltage === '110');
+    else if (quickFilter === 'incomplete') list = list.filter((e) => isIncomplete(e));
+
+    const counts = new Map<number, number>();
+    let noDateCount = 0;
+    list.forEach((e) => {
+      const y = getYear(e.date);
+      if (y) counts.set(y, (counts.get(y) || 0) + 1);
+      else noDateCount++;
+    });
+    return { counts, noDateCount };
+  }, [events, quickFilter]);
+
   const filtered = useMemo(() => {
     let list = events;
     // вкладка по году
@@ -1032,7 +1086,7 @@ export default function App() {
           Все годы ({events.length})
         </button>
         {years.list.map((y) => {
-          const cnt = events.filter((e) => getYear(e.date) === y).length;
+          const cnt = eventsForYearTabs.counts.get(y) || 0;
           return (
             <button key={y} onClick={() => setActiveYear(y)}
               className={`px-4 py-1.5 rounded-t-md text-sm font-semibold border border-b-0 ${
@@ -1047,7 +1101,7 @@ export default function App() {
             className={`px-4 py-1.5 rounded-t-md text-sm font-semibold border border-b-0 ${
               activeYear === 'nodate' ? 'bg-white border-slate-300 text-blue-700 -mb-px' : 'bg-slate-200/70 text-slate-600 hover:bg-slate-100 border-transparent'
             }`}>
-            Без даты ({events.filter((e) => !getYear(e.date)).length})
+            Без даты ({eventsForYearTabs.noDateCount})
           </button>
         )}
       </div>
